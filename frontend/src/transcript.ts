@@ -55,3 +55,10 @@ export function search(segs: Seg[], query: string, max = 500): Hit[] {
   }
   return hits
 }
+
+/** « HH:MM:SS.mmm », « MM:SS » ou secondes brutes -> secondes ; null si invalide. */
+export function parseTime(s: string): number | null {
+  const t = s.trim().replace(',', '.')
+  if (!/^\d+(\.\d+)?$|^(\d+:){1,2}\d+(\.\d+)?$/.test(t)) return null
+  return t.split(':').reduce((acc, x) => acc * 60 + parseFloat(x), 0)
+}

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, fileClass, fileLabel, fmtDate, fmtDuration, LABELS, type Project } from './api'
+import Icon from './Icon'
+import { api, fileLabel, fmtDate, fmtDuration, LABELS, type Project } from './api'
 
 export default function Library() {
   const [projects, setProjects] = useState<Project[] | null>(null)
@@ -52,50 +53,51 @@ export default function Library() {
   }
 
   return (
-    <>
+    <div className="page">
       <h1>Bibliothèque de VOD</h1>
-      <div className="row">
-        <select value={video} onChange={e => setVideo(e.target.value)}>
+      <div className="row lib-tools">
+        <select className="grow" aria-label="Vidéo" value={video} onChange={e => setVideo(e.target.value)}>
           <option value="">— Choisir une vidéo existante —</option>
           {videos.map(v => <option key={v}>{v}</option>)}
         </select>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="Nom (optionnel)" />
-        <button onClick={create} disabled={!video}>Créer le projet</button>
+        <button className="primary" onClick={create} disabled={!video}>Créer le projet</button>
       </div>
       {msg && <p className="err">{msg}</p>}
-      <div className="row tools">
-        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Rechercher un projet…" />
-        <select value={sort} onChange={e => setSort(e.target.value)} style={{ flex: 'none' }}>
+      <div className="row lib-tools">
+        <span className="search" style={{ position: 'relative', flex: 1, display: 'flex', alignItems: 'center' }}>
+          <input type="search" style={{ width: '100%' }} value={search} onChange={e => setSearch(e.target.value)} placeholder="Rechercher un projet…" />
+        </span>
+        <select value={sort} onChange={e => setSort(e.target.value)} aria-label="Tri">
           <option value="date-desc">Plus récents</option>
           <option value="date-asc">Plus anciens</option>
           <option value="name-asc">Nom A → Z</option>
           <option value="name-desc">Nom Z → A</option>
         </select>
       </div>
-      {projects === null && <p>Chargement…</p>}
+      {projects === null && <p className="empty">Chargement…</p>}
       {projects?.length === 0 && !msg && <p className="empty">Aucun projet. Choisissez une vidéo ci-dessus pour en créer un.</p>}
       {projects && projects.length > 0 && shown.length === 0 && <p className="empty">Aucun projet ne correspond à « {search} ».</p>}
-      {shown.map(p => (
-        <div className="card" key={p.id}>
-          <div className="card-head">
-            <a href={`#/projects/${p.id}`}><b>{p.name}</b></a>
-            <span className={`badge ${p.status}`}>{LABELS[p.status]}</span>
-          </div>
-          <div className="meta">
-            <span className={p.video_exists ? '' : 'err'}>{p.video_name}{p.video_exists ? '' : ' (introuvable)'}</span>
-            <span>Durée : {fmtDuration(p.duration)}</span>
-            <span>Créé : {fmtDate(p.created_at)}</span>
-            <span>Modifié : {fmtDate(p.updated_at)}</span>
-          </div>
-          <div className="meta">
-            <span>SRT : <span className={`badge ${fileClass(p.srt)}`}>{fileLabel(p.srt)}</span></span>
-            <span>JSON : <span className={`badge ${fileClass(p.json)}`}>{fileLabel(p.json)}</span></span>
-            <span className="spacer" />
-            <a href={`#/projects/${p.id}`}>Ouvrir</a>
-            <button className="danger" onClick={() => remove(p)}>Supprimer</button>
-          </div>
+      {shown.length > 0 && (
+        <div className="lib-list">
+          {shown.map(p => (
+            <div className="lib-row" key={p.id}>
+              <div style={{ minWidth: 0 }}>
+                <a className="name" href={`#/projects/${p.id}`}>{p.name}</a>
+                <span className={`sub ${p.video_exists ? '' : 'err'}`}>{p.video_name}{p.video_exists ? '' : ' (introuvable)'} · SRT {p.srt?.exists ? '✓' : '—'} · JSON {p.json?.exists ? '✓' : '—'}</span>
+              </div>
+              <span className="num hide-s" title="Durée">{fmtDuration(p.duration)}</span>
+              <span className="num hide-s" title={`Modifié : ${fmtDate(p.updated_at)}`}>{fmtDate(p.created_at)}</span>
+              <span className="row" style={{ gap: 10 }}>
+                <span className={`badge ${p.status}`} title={`SRT : ${fileLabel(p.srt)} · JSON : ${fileLabel(p.json)}`}>{LABELS[p.status]}</span>
+              </span>
+              <span className="actions">
+                <button className="ghost danger" onClick={() => remove(p)} title="Supprimer le projet" aria-label="Supprimer le projet"><Icon n="trash" /></button>
+              </span>
+            </div>
+          ))}
         </div>
-      ))}
-    </>
+      )}
+    </div>
   )
 }
