@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { activeWord, findLast, fmtTime, groupWords, search, type Word } from './transcript.ts'
+import { activeWord, findLast, fmtTime, groupWords, parseTime, search, type Word } from './transcript.ts'
 
 const words: Word[] = [[1, 2, 'a'], [2, 3, 'b'], [10, 11, 'c']]
 const starts = words.map(w => w[0])
@@ -37,4 +37,13 @@ test('search: accents, casse, plusieurs occurrences, vide', () => {
   assert.equal(search(segs, 'léa')[0].seg, 1)
   assert.equal(search(segs, '  ').length, 0)
   assert.equal(search(segs, 'zzz').length, 0)
+})
+
+test('parseTime', () => {
+  assert.equal(parseTime('01:02:05.500'), 3725.5)
+  assert.equal(parseTime('2:05'), 125)
+  assert.equal(parseTime('90,5'), 90.5)
+  assert.equal(parseTime('abc'), null)
+  assert.equal(parseTime('1:'), null)
+  assert.equal(parseTime(''), null)
 })

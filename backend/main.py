@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,11 +11,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from typing import Literal
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from . import transcript
+from . import analysis, transcript
 
 ROOT = Path(__file__).resolve().parent.parent
 VIDEO_DIR = Path(os.environ.get("VIDEO_DIR", ROOT)).resolve()
@@ -61,6 +64,7 @@ def init_db():
     msg = "Interrompu par un redémarrage du backend."
     q("UPDATE runs SET status='error', error=?, ended_at=? WHERE status='running'", (msg, now()))
     q("UPDATE projects SET status='error', error=? WHERE status='running'", (msg,))
+    init_analysis_db(msg)
 
 
 @asynccontextmanager
@@ -140,6 +144,8 @@ def launch(video: Path, pid=None):
     with lock:  # protège contre les doubles lancements
         if job["status"] == "running":
             raise HTTPException(409, "Une transcription est déjà en cours.")
+        if acur["id"]:
+            raise HTTPException(409, "Une analyse Ollama est en cours : annulez-la ou attendez sa fin.")
         job.update(status="running", video=video.name, project_id=pid, error=None, files=None)
         job["logs"].clear()
     run_id = None
@@ -272,3 +278,253 @@ def project_video(pid: str):
 def project_transcript(pid: str):
     row = get_row(pid)
     return transcript.load(row["srt_path"], row["json_path"])
+
+
+# ---------- phase 4 : analyse Ollama et moments détectés ----------
+
+acur = {"id": None, "cancel": threading.Event()}  # une seule analyse à la fois (VRAM/RAM locales)
+DEFAULTS = {"model": None, "window": 300, "overlap": 30, "num_ctx": 8192}
+
+
+def init_analysis_db(interrupted):
+    q("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+    q("""CREATE TABLE IF NOT EXISTS analyses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL, model TEXT NOT NULL, params TEXT NOT NULL,
+        status TEXT NOT NULL, total INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    q("""CREATE TABLE IF NOT EXISTS analysis_chunks (
+        analysis_id INTEGER NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+        idx INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY (analysis_id, idx))""")
+    q("""CREATE TABLE IF NOT EXISTS moments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        analysis_id INTEGER NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title TEXT NOT NULL, summary TEXT, category TEXT NOT NULL, justification TEXT, passage TEXT,
+        score INTEGER NOT NULL, confidence TEXT, needs_review INTEGER NOT NULL, aligned INTEGER NOT NULL,
+        t_start REAL, t_end REAL, auto_start REAL, auto_end REAL, hint TEXT, sources TEXT,
+        status TEXT NOT NULL DEFAULT 'pending', favorite INTEGER NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT '', edited INTEGER NOT NULL DEFAULT 0)""")
+    # une analyse interrompue par un redémarrage reste reprenable (les blocs finis sont conservés)
+    q("UPDATE analyses SET status='error', error=?, updated_at=? WHERE status IN ('running','pending')", (interrupted, now()))
+
+
+def get_config():
+    cfg = dict(DEFAULTS)
+    for r in q("SELECT key, value FROM settings WHERE key LIKE 'analysis.%'"):
+        cfg[r["key"][9:]] = json.loads(r["value"])
+    return cfg
+
+
+def check_config(c):
+    if not (60 <= c["window"] <= 1800):
+        raise HTTPException(422, "La taille des blocs doit être comprise entre 60 et 1800 secondes.")
+    if not (0 <= c["overlap"] <= c["window"] / 2):
+        raise HTTPException(422, "Le chevauchement doit être compris entre 0 et la moitié de la taille des blocs.")
+    if not (2048 <= c["num_ctx"] <= 131072):
+        raise HTTPException(422, "Le contexte (num_ctx) doit être compris entre 2048 et 131072.")
+    return c
+
+
+class AnalysisConfig(BaseModel):
+    model: str | None = None
+    window: int | None = None
+    overlap: int | None = None
+    num_ctx: int | None = None
+
+
+def merged_config(req):
+    # exclude_none : un champ nul (modèle non choisi) ne doit pas écraser la valeur enregistrée
+    return check_config({**get_config(), **req.model_dump(exclude_none=True)})
+
+
+@app.get("/api/ollama")
+def ollama_status():
+    cfg = get_config()
+    try:
+        return {"available": True, "models": analysis.list_models(), "error": None, "config": cfg}
+    except analysis.OllamaError as e:
+        return {"available": False, "models": [], "error": str(e), "config": cfg}
+
+
+@app.put("/api/analysis/config")
+def set_config(req: AnalysisConfig):
+    cfg = merged_config(req)
+    for k, v in cfg.items():
+        q("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+          (f"analysis.{k}", json.dumps(v)))
+    return cfg
+
+
+def analysis_view(r):
+    a = dict(r)
+    a["params"] = json.loads(a["params"])
+    a.pop("fingerprint")
+    return a
+
+
+def set_analysis(aid, **kw):
+    cols = ", ".join(f"{k}=?" for k in kw)
+    q(f"UPDATE analyses SET {cols}, updated_at=? WHERE id=?", (*kw.values(), now(), aid))
+
+
+def run_analysis(aid, pid, segs, words, model, params, thinking, ctx, cancel):
+    try:
+        num_ctx = min(params["num_ctx"], ctx or params["num_ctx"])
+        # ~3 caractères par jeton en français ; on garde 4000 jetons pour consigne + réponse
+        chunks = analysis.make_chunks(segs, params["window"], params["overlap"], max(2000, (num_ctx - 4000) * 3))
+        set_analysis(aid, total=len(chunks), error=None)
+        done = {r["idx"] for r in q("SELECT idx FROM analysis_chunks WHERE analysis_id=?", (aid,))}
+        set_analysis(aid, done=len(done))
+        failed = 0
+        for idx, ch in enumerate(chunks):
+            if idx in done:
+                continue
+            dets = None
+            for _ in range(2):  # une relance si le modèle renvoie un JSON inexploitable
+                raw = analysis.chat(model, analysis.chunk_prompt(segs, ch), num_ctx, cancel, thinking)
+                try:
+                    dets = analysis.parse_response(raw)
+                    break
+                except ValueError:
+                    pass
+            if dets is None:
+                failed += 1
+                continue
+            located = [analysis.locate(d, segs, words, ch) for d in dets]
+            q("INSERT OR REPLACE INTO analysis_chunks (analysis_id, idx, result) VALUES (?, ?, ?)", (aid, idx, json.dumps(located)))
+            done.add(idx)
+            set_analysis(aid, done=len(done))
+        if cancel.is_set():
+            raise analysis.Cancelled()
+        if failed:
+            set_analysis(aid, status="error", error=f"{failed} bloc(s) sans réponse exploitable du modèle : relancez pour les reprendre.")
+            return
+        dets = [d for r in q("SELECT result FROM analysis_chunks WHERE analysis_id=? ORDER BY idx", (aid,)) for d in json.loads(r["result"])]
+        q("DELETE FROM moments WHERE analysis_id=?", (aid,))
+        for m in analysis.merge(dets):
+            q("""INSERT INTO moments (analysis_id, project_id, title, summary, category, justification, passage, score, confidence,
+                 needs_review, aligned, t_start, t_end, auto_start, auto_end, hint, sources) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (aid, pid, m["title"], m["summary"], m["category"], m["justification"], m["passage"], m["score"], m["confidence"],
+               int(m["needs_review"]), int(m["aligned"]), m["start"], m["end"], m["start"], m["end"],
+               json.dumps(m["hint"]), json.dumps(m["sources"])))
+        set_analysis(aid, status="done")
+    except analysis.Cancelled:
+        set_analysis(aid, status="cancelled")
+    except analysis.OllamaError as e:
+        set_analysis(aid, status="error", error=str(e))
+    except Exception as e:
+        set_analysis(aid, status="error", error=f"Erreur inattendue : {e}")
+    finally:
+        acur["id"] = None
+
+
+@app.get("/api/projects/{pid}/analyses")
+def list_analyses(pid: str):
+    get_row(pid)
+    return [analysis_view(r) for r in q("SELECT * FROM analyses WHERE project_id=? ORDER BY id DESC", (pid,))]
+
+
+@app.post("/api/projects/{pid}/analyses")
+def start_analysis(pid: str, req: AnalysisConfig):
+    row = get_row(pid)
+    cfg = merged_config(req)
+    if not cfg["model"]:
+        raise HTTPException(422, "Sélectionnez un modèle Ollama.")
+    try:
+        info = next((m for m in analysis.list_models() if m["name"] == cfg["model"]), None)
+    except analysis.OllamaError as e:
+        raise HTTPException(503, str(e))
+    if not info:  # jamais de téléchargement automatique
+        raise HTTPException(422, f"Le modèle « {cfg['model']} » n'est pas installé dans Ollama.")
+    data = transcript.load(row["srt_path"], row["json_path"])
+    if not data["segments"]:
+        raise HTTPException(422, "Aucun transcript exploitable pour ce projet.")
+    params = {k: cfg[k] for k in ("window", "overlap", "num_ctx")} | {"prompt_version": analysis.PROMPT_VERSION}
+    fp = hashlib.sha256(json.dumps([data["segments"], data["words"], cfg["model"], params], sort_keys=True).encode()).hexdigest()
+    with lock:
+        if acur["id"] or job["status"] == "running":
+            raise HTTPException(409, "Une analyse ou une transcription est déjà en cours (ressources locales limitées).")
+        old = q("SELECT id, status FROM analyses WHERE project_id=? AND fingerprint=?", (pid, fp))
+        if old and old[0]["status"] == "done":
+            raise HTTPException(409, "Cette analyse (mêmes données et paramètres) est déjà terminée. Supprimez-la pour la refaire.")
+        ts = now()
+        if old:  # reprise : les blocs déjà terminés sont conservés
+            aid = old[0]["id"]
+            set_analysis(aid, status="running", error=None)
+        else:
+            aid = q("INSERT INTO analyses (project_id, fingerprint, model, params, status, created_at, updated_at) "
+                    "VALUES (?,?,?,?, 'running', ?, ?) RETURNING id", (pid, fp, cfg["model"], json.dumps(params), ts, ts))[0][0]
+        acur["id"] = aid
+        acur["cancel"] = cancel = threading.Event()
+    threading.Thread(target=run_analysis, args=(aid, pid, data["segments"], data["words"], cfg["model"], params,
+                                                info["thinking"], info["context"], cancel), daemon=True).start()
+    return analysis_view(q("SELECT * FROM analyses WHERE id=?", (aid,))[0])
+
+
+@app.post("/api/analyses/{aid}/cancel")
+def cancel_analysis(aid: int):
+    if acur["id"] != aid:
+        raise HTTPException(409, "Cette analyse n'est pas en cours.")
+    acur["cancel"].set()
+    return {"cancelling": aid}
+
+
+@app.delete("/api/analyses/{aid}")
+def delete_analysis(aid: int):
+    if acur["id"] == aid:
+        raise HTTPException(409, "Analyse en cours : annulez-la d'abord.")
+    q("DELETE FROM analyses WHERE id=?", (aid,))  # supprime aussi blocs et moments ; jamais le transcript
+    return {"deleted": aid}
+
+
+def moment_view(r):
+    m = dict(r)
+    for k in ("needs_review", "aligned", "favorite", "edited"):
+        m[k] = bool(m[k])
+    m["hint"] = json.loads(m["hint"] or "null")
+    m["sources"] = json.loads(m["sources"] or "[]")
+    return m
+
+
+@app.get("/api/projects/{pid}/moments")
+def list_moments(pid: str, analysis_id: int | None = None):
+    get_row(pid)
+    if analysis_id is None:
+        last = q("SELECT id FROM analyses WHERE project_id=? AND status='done' ORDER BY id DESC LIMIT 1", (pid,))
+        if not last:
+            return []
+        analysis_id = last[0]["id"]
+    return [moment_view(r) for r in q("SELECT * FROM moments WHERE project_id=? AND analysis_id=? ORDER BY id", (pid, analysis_id))]
+
+
+class MomentPatch(BaseModel):
+    status: Literal["pending", "accepted", "rejected"] | None = None
+    favorite: bool | None = None
+    note: str | None = None
+    start: float | None = None
+    end: float | None = None
+
+
+@app.patch("/api/moments/{mid}")
+def patch_moment(mid: int, req: MomentPatch):
+    rows = q("SELECT * FROM moments WHERE id=?", (mid,))
+    if not rows:
+        raise HTTPException(404, "Moment introuvable.")
+    d = req.model_dump(exclude_unset=True)
+    sets = {}
+    if d.get("status") is not None:
+        sets["status"] = d["status"]
+    if d.get("favorite") is not None:
+        sets["favorite"] = int(d["favorite"])
+    if d.get("note") is not None:
+        sets["note"] = d["note"][:5000]
+    if "start" in d or "end" in d:
+        a, b = d.get("start", rows[0]["t_start"]), d.get("end", rows[0]["t_end"])
+        if a is None or b is None or a < 0 or b <= a:
+            raise HTTPException(422, "Timecodes invalides : le début doit être positif et précéder la fin.")
+        sets.update(t_start=a, t_end=b, edited=1)
+    if sets:
+        q(f"UPDATE moments SET {', '.join(f'{k}=?' for k in sets)} WHERE id=?", (*sets.values(), mid))
+    return moment_view(q("SELECT * FROM moments WHERE id=?", (mid,))[0])
