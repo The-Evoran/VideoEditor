@@ -1,0 +1,18 @@
+venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+data/
+.webui_secret_key
+# médias et sorties de transcription (volumineux / personnels)
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*_whisper.srt
+*_whisper.json
+/stream.*
+/test.*
+/transcription.txt
+/notesemaine.txt
